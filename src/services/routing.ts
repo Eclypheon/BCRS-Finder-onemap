@@ -1,14 +1,19 @@
 // Walking Routing Service using Singapore SLA OneMap (routetype=walk)
-// Fetches pedestrian path networks across Singapore.
+// Connects via serverless edge proxy with automated 72-hour token renewal.
+// Zero manual token setup required by end users!
 
 export interface WalkingRouteResult {
   coordinates: [number, number][]; // [lat, lng] array formatted for Leaflet polylines
   distanceMeters: number;
   durationSeconds: number;
-  provider?: 'onemap' | 'fallback';
+  provider?: 'onemap' | 'osrm' | 'fallback';
 }
 
 const routeCache = new Map<string, WalkingRouteResult>();
+
+// Default to Cloudflare Edge Proxy which auto-renews OneMap tokens
+const DEFAULT_PROXY = 'https://bcrs-finder-proxy.kester-neo.workers.dev';
+const PROXY_URL = (import.meta.env.VITE_BCRS_PROXY_URL || DEFAULT_PROXY).replace(/\/$/, '');
 
 /**
  * Decodes Google Encoded Polyline format returned by OneMap API
@@ -49,7 +54,7 @@ export function decodePolyline(encoded: string): [number, number][] {
 }
 
 /**
- * Gets the configured OneMap API access token
+ * Gets a manually overridden OneMap token if one was set locally
  */
 export function getOnemapToken(): string | null {
   try {
@@ -65,26 +70,25 @@ export function getOnemapToken(): string | null {
 }
 
 /**
- * Sets the OneMap API token in localStorage
+ * Sets a manual OneMap token in localStorage (optional override)
  */
 export function setOnemapToken(token: string): void {
   try {
     localStorage.setItem('onemap_token', token.trim());
     (window as any).ONEMAP_TOKEN = token.trim();
-  } catch {
-    // storage unavailable
-  }
+  } catch {}
 }
 
-// Expose token setter on window for quick browser console access
 if (typeof window !== 'undefined') {
   (window as any).setOnemapToken = setOnemapToken;
   (window as any).getOnemapToken = getOnemapToken;
 }
 
 /**
- * Fetches the pedestrian walking route between two coordinates in Singapore
- * using the official SLA OneMap pedestrian routing engine (routeType=walk).
+ * Fetches the walking route between two coordinates in Singapore.
+ * 1. Primary: Serverless Edge Proxy (automated OneMap token renewal, zero hassle for users)
+ * 2. Secondary: Direct OneMap if manual token is present
+ * 3. Fallback: OpenStreetMap OSRM pedestrian engine
  */
 export async function fetchWalkingRoute(
   startLat: number,
@@ -97,48 +101,33 @@ export async function fetchWalkingRoute(
     return routeCache.get(cacheKey)!;
   }
 
-  // OneMap expects start=lat,lng&end=lat,lng&routeType=walk
-  const url = `https://www.onemap.gov.sg/api/public/routingsvc/route?start=${startLat.toFixed(6)},${startLng.toFixed(6)}&end=${endLat.toFixed(6)},${endLng.toFixed(6)}&routeType=walk`;
+  const startCoord = `${startLat.toFixed(6)},${startLng.toFixed(6)}`;
+  const endCoord = `${endLat.toFixed(6)},${endLng.toFixed(6)}`;
 
-  const token = getOnemapToken();
-
+  // 1. Primary: Query Cloudflare Worker Proxy (Automated OneMap token renewal)
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 6000);
 
-    const headers: Record<string, string> = {
-      Accept: 'application/json',
-    };
-
-    if (token) {
-      headers['Authorization'] = token.startsWith('Bearer ') ? token : token;
-    }
-
-    const res = await fetch(url, {
+    const proxyRouteUrl = `${PROXY_URL}/route?start=${startCoord}&end=${endCoord}&routeType=walk`;
+    const res = await fetch(proxyRouteUrl, {
       signal: controller.signal,
-      headers,
+      headers: { Accept: 'application/json' },
     });
     clearTimeout(timeoutId);
-
-    if (res.status === 401 || res.status === 403) {
-      console.warn(
-        'OneMap route returned 401/403 Unauthorized. OneMap requires an access token in the Authorization header. You can set it in localStorage via setOnemapToken("YOUR_TOKEN").'
-      );
-    }
 
     if (res.ok) {
       const data = await res.json();
       const geom = data?.route_geometry;
       if (geom && typeof geom === 'string') {
-        const decodedCoords = decodePolyline(geom);
-        if (decodedCoords.length > 0) {
+        const decoded = decodePolyline(geom);
+        if (decoded.length > 0) {
           const result: WalkingRouteResult = {
-            coordinates: decodedCoords,
+            coordinates: decoded,
             distanceMeters: Math.round(data?.route_summary?.total_distance || 0),
             durationSeconds: Math.round(data?.route_summary?.total_time || 0),
             provider: 'onemap',
           };
-
           if (routeCache.size > 100) {
             const firstKey = routeCache.keys().next().value;
             if (firstKey) routeCache.delete(firstKey);
@@ -149,10 +138,64 @@ export async function fetchWalkingRoute(
       }
     }
   } catch (err: any) {
-    console.warn('OneMap walking route lookup failed:', err?.message);
+    console.info('Proxy OneMap route lookup skipped, trying local or OSRM:', err?.message);
   }
 
-  // Fallback: direct line between start and destination
+  // 2. Secondary: Direct OneMap API call if manual token was configured
+  const localToken = getOnemapToken();
+  if (localToken) {
+    try {
+      const directUrl = `https://www.onemap.gov.sg/api/public/routingsvc/route?start=${startCoord}&end=${endCoord}&routeType=walk`;
+      const res = await fetch(directUrl, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: localToken.startsWith('Bearer ') ? localToken : localToken,
+        },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const geom = data?.route_geometry;
+        if (geom && typeof geom === 'string') {
+          const decoded = decodePolyline(geom);
+          if (decoded.length > 0) {
+            const result: WalkingRouteResult = {
+              coordinates: decoded,
+              distanceMeters: Math.round(data?.route_summary?.total_distance || 0),
+              durationSeconds: Math.round(data?.route_summary?.total_time || 0),
+              provider: 'onemap',
+            };
+            routeCache.set(cacheKey, result);
+            return result;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 3. Fallback: OpenStreetMap OSRM pedestrian routing
+  try {
+    const osrmUrl = `https://router.project-osrm.org/route/v1/walking/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson`;
+    const res = await fetch(osrmUrl);
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.code === 'Ok' && Array.isArray(data?.routes) && data.routes.length > 0) {
+        const primary = data.routes[0];
+        const rawCoords: [number, number][] = primary.geometry.coordinates;
+        const latLngs: [number, number][] = rawCoords.map(([lng, lat]) => [lat, lng]);
+
+        const result: WalkingRouteResult = {
+          coordinates: latLngs,
+          distanceMeters: Math.round(primary.distance || 0),
+          durationSeconds: Math.round(primary.duration || 0),
+          provider: 'osrm',
+        };
+        routeCache.set(cacheKey, result);
+        return result;
+      }
+    }
+  } catch (_) {}
+
+  // 4. Final Fallback: Direct straight dotted line
   return {
     coordinates: [
       [startLat, startLng],
